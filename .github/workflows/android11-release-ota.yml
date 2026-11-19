@@ -1,0 +1,302 @@
+# =============================================================================
+# Decaid Android 11 适配版 —— 带 OTA 支持的构建发布
+# =============================================================================
+#
+# 仓库: https://github.com/UncleIce/decaid-android11
+#
+# 【与 android11-release.yml 的区别】
+#   1. 用 patch-android11.sh --with-ota（11 处补丁，含 OTA 数据源重定向）
+#   2. 注入 BUILD_NUMBER 并写进 release name，供 App 识别同版本更新
+#   3. 产物后缀为 -ota，避免与基础版混淆
+#
+# 【OTA 生效的必要条件】
+#   · release 的 name 必须形如 "v0.9.2 (build 42)"
+#     → 补丁 7b 用正则 build[\s:]+(\d+) 解析出 42
+#   · prerelease 必须为 false → stable 通道才会读到
+#   · assets 里必须有 .apk → 否则 "No APK found in release"
+#
+# 【tag 仍用上游原样 v*】
+#   不污染上游版本号语义；同版本的重复构建靠 build number 区分。
+# =============================================================================
+
+name: Android 11 Build & Release (OTA)
+
+on:
+  push:
+    tags:
+      # 只响应带前缀的本仓库 tag，避免被继承来的上游 v* tag 触发
+      - 'android11-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '用于产物的版本标签（如 v0.9.2，会自动加 android11- 前缀）'
+        required: true
+        default: 'v0.9.2-dryrun'
+
+concurrency:
+  group: android11-ota-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  FLUTTER_VERSION: '3.47.9'
+  EXPECTED_SIGNATURE: ${{ vars.EXPECTED_SIGNATURE }}
+
+jobs:
+  precheck:
+    name: 预检补丁
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      # OTA 依赖 build number 区分同版本重构建；
+      # run_number 仓库内单调递增，适合做 build 号
+      build_number: ${{ steps.meta.outputs.build_number }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 解析版本号
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            REF="${{ inputs.tag }}"
+          else
+            REF="${GITHUB_REF#refs/tags/}"
+          fi
+
+          # tag 形如 android11-v0.9.2；手动触发允许只填 v0.9.2
+          case "$REF" in
+            android11-*) TAG="$REF" ;;
+            *)           TAG="android11-$REF" ;;
+          esac
+
+          VERSION="${TAG#android11-}"
+          VERSION="${VERSION#v}"
+
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::版本号不合法: '$VERSION'（来自 tag '$REF'）"
+            echo "::error::期望形如 android11-v0.9.2 或 v0.9.2"
+            exit 1
+          fi
+
+          BUILD_NUMBER="${{ github.run_number }}"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "标签: $TAG"
+          echo "版本: $VERSION (build $BUILD_NUMBER)"
+
+      - name: 应用补丁（DRY RUN）
+        run: |
+          chmod +x patch-android11.sh
+          DRY_RUN=1 ./patch-android11.sh --with-ota .
+
+  build:
+    name: 编译 APK
+    needs: precheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          pub-cache: true
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: 注入签名密钥
+        run: |
+          if [ -z "${{ secrets.ANDROID_KEYSTORE_B64 }}" ]; then
+            echo "::error::缺少 ANDROID_KEYSTORE_B64"
+            exit 1
+          fi
+          echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > android/app/debug.keystore
+
+      - name: 核验密钥指纹
+        run: |
+          ACTUAL=$(keytool -list -v -keystore android/app/debug.keystore \
+                     -storepass android -alias androiddebugkey 2>/dev/null \
+                   | grep -i 'SHA256:' | head -1 \
+                   | sed 's/.*SHA256: *//' | tr -d ': ' | tr 'A-Z' 'a-z')
+          echo "密钥指纹: $ACTUAL"
+          if [ -n "$EXPECTED_SIGNATURE" ] && [ "$ACTUAL" != "$EXPECTED_SIGNATURE" ]; then
+            echo "::error::密钥指纹不符！期望 $EXPECTED_SIGNATURE"
+            exit 1
+          fi
+
+      - name: 应用补丁
+        run: |
+          chmod +x patch-android11.sh
+          ./patch-android11.sh --with-ota .
+
+      - name: 静态检查
+        continue-on-error: true
+        run: flutter analyze --no-pub lib/src/services/android_updater.dart
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      - name: 拉取外部插件
+        continue-on-error: true
+        run: |
+          for s in fetch_dye2_plugin.sh fetch_shot_upload_plugin.sh fetch_dcamp_plugin.sh; do
+            [ -x "scripts/$s" ] && ./scripts/$s || echo "::warning::$s 跳过"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # 编译 —— 必须注入 VERSION 和 BUILD_NUMBER
+      # -----------------------------------------------------------------------
+      # BUILD_NUMBER 是 OTA 识别「同版本重构建」的唯一依据。
+      # 不注入的话 BuildInfo.buildNumber = '0'，永远收不到同版本更新。
+      # -----------------------------------------------------------------------
+      - name: 编译 APK
+        run: |
+          VERSION="${{ needs.precheck.outputs.version }}"
+          BUILD_NUMBER="${{ needs.precheck.outputs.build_number }}"
+          echo "编译: VERSION=$VERSION BUILD_NUMBER=$BUILD_NUMBER"
+
+          if [ -x ./flutter_with_commit.sh ]; then
+            # 上游脚本自己会注入 VERSION/BUILD_NUMBER，但 BUILD_NUMBER
+            # 用的是 git rev-list 计数。这里额外显式传入覆盖。
+            ./flutter_with_commit.sh build apk --release \
+              --target-platform android-arm64 \
+              --dart-define=VERSION="$VERSION" \
+              --dart-define=BUILD_NUMBER="$BUILD_NUMBER"
+          else
+            flutter build apk --release --target-platform android-arm64 \
+              --dart-define=VERSION="$VERSION" \
+              --dart-define=BUILD_NUMBER="$BUILD_NUMBER"
+          fi
+        env:
+          FEEDBACK_TOKEN: ${{ secrets.FEEDBACK_TOKEN }}
+
+      - name: 校验产物
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          test -f "$APK" || { echo "::error::产物不存在"; exit 1; }
+          echo "大小: $(du -h "$APK" | cut -f1)"
+
+          echo "--- 验证补丁已编入 ---"
+          STR=$(unzip -p "$APK" lib/arm64-v8a/libapp.so 2>/dev/null | strings || true)
+          for marker in "degraded mode DISABLED" "Compatibility check BYPASSED" \
+                        "UncleIce" "decaid-android11" "Same version"; do
+            if echo "$STR" | grep -qF "$marker"; then
+              echo "✓ 含标记: $marker"
+            else
+              echo "::error::产物中缺少标记: $marker"
+              exit 1
+            fi
+          done
+
+          echo "--- 验证签名 ---"
+          SIG=$(apksigner verify --print-certs "$APK" 2>/dev/null \
+                | grep 'SHA-256 digest' | head -1 | awk '{print $NF}')
+          echo "签名: $SIG"
+          if [ -n "$EXPECTED_SIGNATURE" ] && [ "$SIG" != "$EXPECTED_SIGNATURE" ]; then
+            echo "::error::签名不符！"
+            exit 1
+          fi
+
+      - name: 重命名
+        run: |
+          V="${{ needs.precheck.outputs.version }}"
+          B="${{ needs.precheck.outputs.build_number }}"
+          mkdir -p out
+          cp build/app/outputs/flutter-apk/app-release.apk \
+             "out/decaid-android11-ota-${V}-b${B}-arm64.apk"
+          sha256sum out/*.apk | tee out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android11-ota-apk
+          path: out/
+
+  release:
+    name: 发布
+    needs: [precheck, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android11-ota-apk
+          path: out
+
+      # -----------------------------------------------------------------------
+      # ★ 关键：name 里必须含 "build N"
+      # -----------------------------------------------------------------------
+      # App 端补丁 7b 用正则 /build[\s:]+(\d+)/i 从 name 解析构建号。
+      # 改了这个格式，OTA 就认不出同版本重构建，只会退化成按版本号比较。
+      # -----------------------------------------------------------------------
+      - name: 生成 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          # ↓↓↓ 格式不可随意改：括号内的 build N 是 OTA 的识别依据
+          name: "${{ github.ref_name }} (build ${{ needs.precheck.outputs.build_number }})"
+          prerelease: false
+          files: out/*
+          body: |
+            ## Android 11 适配版 · ${{ github.ref_name }}
+
+            > ⚠️ **非官方构建**，基于 [decentespresso/decaid](https://github.com/decentespresso/decaid)（GPL-3.0）
+
+            | | |
+            |---|---|
+            | 版本 | `${{ needs.precheck.outputs.version }}` |
+            | 构建号 | `${{ needs.precheck.outputs.build_number }}` |
+            | 平台 | Android 11+ (arm64-v8a) |
+            | 签名 | 与历史 Android 11 适配版一致，可覆盖升级 |
+
+            ### 本版内容
+
+            - 解除 Android 12+ 限制，Android 11 内嵌显示界面
+            - **OTA 指向本仓库**，可在 App 内直接检查更新
+            - 同版本重构建可通过构建号识别并提示
+
+            ### ⚠️ 关于「构建号」
+
+            本 Release 名称中的 `build ${{ needs.precheck.outputs.build_number }}`
+            是 App 判断「同版本是否需要更新」的依据，**请勿修改 Release 名称**，
+            否则客户端可能收不到这次更新。
+
+            ### 安装
+
+            通常通过 App 内 `Settings → UPDATES → 检查更新` 直接完成。
+            手动安装：
+
+            ```bash
+            adb install -r decaid-android11-ota-${{ needs.precheck.outputs.version }}-b${{ needs.precheck.outputs.build_number }}-arm64.apk
+            ```
+
+            ### 许可
+
+            GPL-3.0 · 源码 https://github.com/UncleIce/decaid-android11
