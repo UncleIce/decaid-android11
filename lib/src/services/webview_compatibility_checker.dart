@@ -60,6 +60,14 @@ class WebViewCompatibilityChecker {
       return _cachedResult!;
     }
 
+    // === PATCHED (UncleIce/decaid-android11): force embedded WebView ===
+    // 跳过 WebView 自检，强制使用内嵌 WebView 显示界面。
+    // 修改自 Decaid (GPL-3.0) https://github.com/decentespresso/decaid
+    _log.warning('Compatibility check BYPASSED (patched build)');
+    _cachedResult = const CompatibilityResult.compatible();
+    return _cachedResult!;
+
+    // ignore: dead_code
     _log.info('Starting WebView compatibility check...');
 
     final deviceCheckResult = await _checkDeviceInfo();

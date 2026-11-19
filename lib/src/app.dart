@@ -248,7 +248,14 @@ class _MyAppState extends State<MyApp> {
     if (!Platform.isAndroid) return;
     try {
       final info = await DeviceInfoPlugin().androidInfo;
-      if (mounted && info.version.sdkInt < 31) {
+      // === PATCHED (UncleIce/decaid-android11) ===
+      // 原逻辑：sdkInt < 31 即标记降级，不内嵌显示界面。
+      // 改为：记录版本但不降级，强制内嵌 WebView。
+      _log.info(
+        'PATCHED: Android SDK ${info.version.sdkInt} - degraded mode DISABLED',
+      );
+      // ignore: dead_code
+      if (false && mounted && info.version.sdkInt < 31) {
         setState(() => _degradedAndroid = true);
       }
     } catch (e) {
@@ -326,7 +333,7 @@ class _MyAppState extends State<MyApp> {
         Platform.isAndroid ||
         Platform.isMacOS ||
         Platform.isWindows;
-    if (!supportedPlatforms || _degradedAndroid) {
+    if (!supportedPlatforms || (false && _degradedAndroid)) {
       _log.info(
         'Skin not auto-opened (unsupported platform or degraded '
         'Android) — launcher shows the browser hero card.',

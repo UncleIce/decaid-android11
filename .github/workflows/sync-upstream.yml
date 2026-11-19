@@ -1,0 +1,265 @@
+# =============================================================================
+# 自动跟进上游新版本
+# =============================================================================
+#
+# 仓库: https://github.com/UncleIce/decaid-android11
+#
+# 【工作流程】
+#   每天定时检查 upstream 是否有新 tag
+#        ↓ 有
+#   验证补丁在新代码上仍能应用
+#        ↓ 能
+#   推送同名 tag 到本仓库 → 触发 android11-release.yml 构建发布
+#        ↓ 不能
+#   创建 Issue 告警，等人工适配
+#
+# 【为什么推送同名 tag】
+#   用户要求 tag 与上游一致（v0.9.3）。fork 的 tag 命名空间独立，
+#   因此可以直接创建与上游同名的 tag 而不冲突。
+#
+# 【为什么先验证补丁】
+#   若补丁在新版本上失效，直接推 tag 会构建失败并发布残缺 release。
+#   先跑 DRY_RUN 验证，能应用才推 tag。
+# =============================================================================
+
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每天 UTC 02:00 = 北京时间 10:00
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只检查，不推送 tag'
+        type: boolean
+        default: false
+      force_version:
+        description: '强制同步指定 tag（留空则自动检测最新）'
+        required: false
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  UPSTREAM: decentespresso/decaid
+
+jobs:
+  sync:
+    name: 检查并同步上游
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: 配置 git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # -----------------------------------------------------------------------
+      # 检测上游最新稳定 tag
+      # -----------------------------------------------------------------------
+      - name: 检测上游新版本
+        id: check
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
+          git fetch upstream --tags --force --quiet
+
+          # 取最新稳定 tag（排除 beta / prerelease），按语义版本排序
+          LATEST=$(git tag -l 'v*' --sort=-v:refname \
+                   | grep -vE 'beta|alpha|rc' \
+                   | head -1)
+
+          # 强制指定
+          if [ -n "${{ inputs.force_version }}" ]; then
+            LATEST="${{ inputs.force_version }}"
+            echo "手动指定版本: $LATEST"
+          fi
+
+          # 本仓库已有的最新 tag
+          git fetch origin --tags --force --quiet 2>/dev/null || true
+          CURRENT=$(git tag -l 'v*' --sort=-v:refname \
+                    | grep -vE 'beta|alpha|rc' \
+                    | head -1)
+
+          echo "上游最新: ${LATEST:-无}"
+          echo "本地已有: ${CURRENT:-无}"
+
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$LATEST" ]; then
+            echo "::error::未找到上游 tag"
+            exit 1
+          fi
+
+          if [ "$LATEST" = "$CURRENT" ]; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "✓ 已是最新，无需更新"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "★ 发现新版本: $LATEST"
+          fi
+
+      # -----------------------------------------------------------------------
+      # 补丁兼容性验证 —— 失败则不推 tag，避免产出坏包
+      # -----------------------------------------------------------------------
+      - name: 验证补丁可应用
+        if: steps.check.outputs.new == 'true'
+        id: verify
+        run: |
+          LATEST="${{ steps.check.outputs.latest }}"
+
+          git checkout -B verify-patch "upstream/$LATEST" 2>/dev/null \
+            || git checkout -B verify-patch "$LATEST"
+
+          chmod +x patch-android11.sh
+
+          if DRY_RUN=1 ./patch-android11.sh . ; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "✓ 补丁可应用于 $LATEST"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "✗ 补丁无法应用，需人工适配"
+          fi
+
+      # -----------------------------------------------------------------------
+      # 应用补丁并提交到 android11 分支
+      # -----------------------------------------------------------------------
+      - name: 应用补丁并提交
+        if: steps.check.outputs.new == 'true' && steps.verify.outputs.ok == 'true'
+        run: |
+          LATEST="${{ steps.check.outputs.latest }}"
+
+          # 基于上游 tag 建分支（而非 merge，保证与上游代码完全一致）
+          git checkout -B android11 "verify-patch"
+          git branch -D verify-patch 2>/dev/null || true
+
+          ./patch-android11.sh .
+
+          # 清理备份文件，不提交
+          rm -f lib/src/app.dart.orig \
+                lib/src/services/webview_compatibility_checker.dart.orig \
+                lib/src/plugins/*.orig 2>/dev/null || true
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "无改动"
+          else
+            git commit -m "chore(android11): 适配 $LATEST"
+            git push origin android11 --force
+            echo "✓ 已推送到 android11 分支"
+          fi
+
+      # -----------------------------------------------------------------------
+      # 推送同名 tag 触发构建
+      # -----------------------------------------------------------------------
+      # 用户要求 tag 与上游一致。fork 的 tag 空间独立，可直接创建同名 tag。
+      # 若本仓库已存在该 tag（重跑场景），先删除再重建。
+      # -----------------------------------------------------------------------
+      - name: 触发构建
+        if: |
+          steps.check.outputs.new == 'true' &&
+          steps.verify.outputs.ok == 'true' &&
+          inputs.dry_run != true
+        run: |
+          LATEST="${{ steps.check.outputs.latest }}"
+
+          # 删除本地同名 tag（若有）
+          git tag -d "$LATEST" 2>/dev/null || true
+
+          # 删除远端同名 tag（若有，用于重跑）
+          git ls-remote --tags origin "refs/tags/$LATEST" 2>/dev/null \
+            | grep -q . && git push origin ":refs/tags/$LATEST" || true
+
+          # 在 android11 分支的补丁提交上打 tag
+          git checkout android11
+          git tag -a "$LATEST" -m "Android 11 适配版 $LATEST"
+          git push origin "$LATEST"
+
+          echo "✓ 已推送 tag $LATEST，构建将自动开始"
+
+      # -----------------------------------------------------------------------
+      # 补丁失效时创建 Issue 告警
+      # -----------------------------------------------------------------------
+      - name: 补丁失效告警
+        if: steps.check.outputs.new == 'true' && steps.verify.outputs.ok != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const latest = '${{ steps.check.outputs.latest }}';
+            const title = `补丁失效：上游 ${latest} 需要人工适配`;
+
+            // 避免重复开 issue
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'patch-broken'
+            });
+            if (issues.some(i => i.title === title)) {
+              console.log('已有相同 issue，跳过');
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              labels: ['patch-broken'],
+              body: `上游发布了 **${latest}**，但 \`patch-android11.sh\` 无法应用于新代码。
+
+              ## 需要做什么
+
+              1. 本地检出该版本：
+                 \`\`\`bash
+                 git fetch upstream --tags
+                 git checkout -b fix-${latest} upstream/${latest}
+                 \`\`\`
+
+              2. 运行补丁看哪一处失败：
+                 \`\`\`bash
+                 DRY_RUN=1 ./patch-android11.sh .
+                 \`\`\`
+
+              3. 定位新的代码位置：
+                 \`\`\`bash
+                 grep -n 'sdkInt' lib/src/app.dart
+                 grep -n 'degradedAndroid' lib/src/app.dart
+                 \`\`\`
+
+              4. 修改 \`patch-android11.sh\` 中对应的 old/new 字符串
+
+              5. 验证通过后推送：
+                 \`\`\`bash
+                 ./patch-android11.sh .
+                 git add -A && git commit -m "fix: 适配 ${latest}"
+                 git push origin fix-${latest}
+                 \`\`\`
+
+              6. 手动触发 Sync Upstream workflow 完成发布
+
+              ## 可能的情况
+
+              如果上游已经把版本门槛从 \`sdkInt < 31\` 改成 \`< 29\`，
+              说明**官方已支持 Android 11**，本项目可以退休了。`
+            });
+
+      - name: 汇总
+        run: |
+          echo "### 同步结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 上游最新 | \`${{ steps.check.outputs.latest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 本地已有 | \`${{ steps.check.outputs.current }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 有新版本 | ${{ steps.check.outputs.new }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 补丁兼容 | ${{ steps.verify.outputs.ok }} |" >> $GITHUB_STEP_SUMMARY
