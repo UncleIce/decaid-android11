@@ -68,50 +68,56 @@ jobs:
       # -----------------------------------------------------------------------
       # 检测上游最新稳定 tag
       # -----------------------------------------------------------------------
+      # 关键：fork 会继承上游所有 tag，名字和我们发的一样（都是 v0.9.x）。
+      # 所以「origin 上存在 v0.9.2」不代表我们已经发布过 —— 那可能是上游的。
+      #
+      # 正确的判断依据：tag 指向的提交里有没有 patch-android11.sh。
+      #   · 有  → 这是我们打过补丁后发布的
+      #   · 没有 → 这是 fork 继承来的上游 tag，尚未发布
+      # -----------------------------------------------------------------------
       - name: 检测上游新版本
         id: check
         run: |
           git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
           git fetch upstream --tags --force --quiet
+          git fetch origin --tags --force --quiet 2>/dev/null || true
 
-          # 取最新稳定 tag（排除 beta / prerelease），按语义版本排序
-          LATEST=$(git tag -l 'v*' --sort=-v:refname \
-                   | grep -vE 'beta|alpha|rc' \
-                   | head -1)
+          # 上游最新稳定 tag（排除 beta/alpha/rc）
+          LATEST=$(git tag -l 'v*' --sort=-v:refname | grep -vE 'beta|alpha|rc' | head -1)
 
-          # 强制指定
           if [ -n "${{ inputs.force_version }}" ]; then
             LATEST="${{ inputs.force_version }}"
             echo "手动指定版本: $LATEST"
           fi
-
-          # 本仓库已有的最新 tag
-          git fetch origin --tags --force --quiet 2>/dev/null || true
-          CURRENT=$(git tag -l 'v*' --sort=-v:refname \
-                    | grep -vE 'beta|alpha|rc' \
-                    | head -1)
-
-          echo "上游最新: ${LATEST:-无}"
-          echo "本地已有: ${CURRENT:-无}"
-
-          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
 
           if [ -z "$LATEST" ]; then
             echo "::error::未找到上游 tag"
             exit 1
           fi
 
-          if [ "$LATEST" = "$CURRENT" ]; then
-            echo "new=false" >> "$GITHUB_OUTPUT"
-            echo "✓ 已是最新，无需更新"
-          else
-            echo "new=true" >> "$GITHUB_OUTPUT"
-            echo "★ 发现新版本: $LATEST"
+          # 该 tag 指向的提交里是否含我们的补丁脚本
+          # = 是否为我们发布过的版本
+          ALREADY=0
+          if git cat-file -e "$LATEST:patch-android11.sh" 2>/dev/null; then
+            ALREADY=1
           fi
 
+          echo "目标版本: $LATEST"
+          if [ "$ALREADY" = "1" ]; then
+            echo "状态: 该版本已由本仓库发布（分支含 patch-android11.sh）"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "状态: 尚未发布，需要构建"
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
       # -----------------------------------------------------------------------
       # 补丁兼容性验证 —— 失败则不推 tag，避免产出坏包
+      # -----------------------------------------------------------------------
+      # 注意：验证要在「保留我们的脚本和 CI」的前提下进行。
+      # 直接用 upstream/$LATEST 会丢掉 patch-android11.sh，
+      # 所以这里用 merge-tree 把上游内容叠到 android11 的配置上。
       # -----------------------------------------------------------------------
       - name: 验证补丁可应用
         if: steps.check.outputs.new == 'true'
@@ -119,9 +125,15 @@ jobs:
         run: |
           LATEST="${{ steps.check.outputs.latest }}"
 
-          git checkout -B verify-patch "upstream/$LATEST" 2>/dev/null \
-            || git checkout -B verify-patch "$LATEST"
+          # 以 android11 为基（保留脚本/CI），把源码切到上游该版本
+          git checkout -B verify-patch android11
 
+          # 只把上游的 lib/ 和 pubspec/android 配置覆盖过来，保留我们的 .github 与脚本
+          git checkout "upstream/$LATEST" -- lib pubspec.yaml android 2>/dev/null \
+            || git checkout "$LATEST" -- lib pubspec.yaml android 2>/dev/null \
+            || true
+
+          test -f patch-android11.sh || { echo "::error::patch-android11.sh 不在分支上"; exit 1; }
           chmod +x patch-android11.sh
 
           if DRY_RUN=1 ./patch-android11.sh . ; then
@@ -140,23 +152,22 @@ jobs:
         run: |
           LATEST="${{ steps.check.outputs.latest }}"
 
-          # 基于上游 tag 建分支（而非 merge，保证与上游代码完全一致）
-          git checkout -B android11 "verify-patch"
+          # verify-patch 已经包含：上游源码 + 我们的脚本/CI
+          git checkout -B android11 verify-patch
           git branch -D verify-patch 2>/dev/null || true
 
           ./patch-android11.sh .
 
           # 清理备份文件，不提交
-          rm -f lib/src/app.dart.orig \
-                lib/src/services/webview_compatibility_checker.dart.orig \
-                lib/src/plugins/*.orig 2>/dev/null || true
+          find lib -name '*.orig' -delete 2>/dev/null || true
 
           git add -A
           if git diff --cached --quiet; then
-            echo "无改动"
+            echo "无改动，仅推进版本"
           else
             git commit -m "chore(android11): 适配 $LATEST"
-            git push origin android11 --force
+          fi
+          git push origin android11 --force
             echo "✓ 已推送到 android11 分支"
           fi
 
@@ -260,7 +271,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| 上游最新 | \`${{ steps.check.outputs.latest }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| 本地已有 | \`${{ steps.check.outputs.current }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| 有新版本 | ${{ steps.check.outputs.new }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 目标版本 | \`${{ steps.check.outputs.latest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 需要构建 | ${{ steps.check.outputs.new }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 补丁兼容 | ${{ steps.verify.outputs.ok }} |" >> $GITHUB_STEP_SUMMARY
