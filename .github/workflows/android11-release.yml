@@ -55,6 +55,12 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          # 显式指定分支：workflow 文件定义在默认分支 main 上（GitHub 要求），
+          # 但补丁代码和脚本在 android11 分支。不指定的话手动触发会检出 main，
+          # 那里没有 patch-android11.sh，预检必然失败。
+          # tag 触发时会自动使用被推的 tag，这里的 ref 只影响 workflow_dispatch。
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'android11' || github.ref }}
 
       - name: 解析版本号
         id: meta
@@ -83,6 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'android11' || github.ref }}
           fetch-depth: 0      # flutter_with_commit.sh 需要 git tag 历史
 
       - name: 安装 Flutter ${{ env.FLUTTER_VERSION }}
