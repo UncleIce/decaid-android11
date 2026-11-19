@@ -22,11 +22,13 @@ name: Android 11 Build & Release
 on:
   push:
     tags:
-      - 'v*'
+      # 只响应本仓库的 tag。fork 会继承上游全部 v* tag（当前 78 个稳定版），
+      # 若写成 'v*' 会把上游 tag 也当作构建目标。
+      - 'android11-v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: '用于产物的版本标签（如 v0.9.3）'
+        description: '用于产物的版本标签（如 v0.9.3，会自动加 android11- 前缀）'
         required: true
         default: 'v0.9.3-dryrun'
 
@@ -70,8 +72,27 @@ jobs:
           else
             REF="${GITHUB_REF#refs/tags/}"
           fi
-          VERSION="${REF#v}"
+
+          # tag 形如 android11-v0.9.2，取后面的 v0.9.2 作为版本标签
+          # 手动触发时允许只填 v0.9.3，统一补上前缀
+          case "$REF" in
+            android11-*) TAG="$REF" ;;
+            *)           TAG="android11-$REF" ;;
+          esac
+
+          # 版本号必须是纯 semver（App 内用 pub_semver 比较）
+          VERSION="${TAG#android11-}"
+          VERSION="${VERSION#v}"
+
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::版本号不合法: '$VERSION'（来自 tag '$REF'）"
+            echo "::error::期望形如 android11-v0.9.2 或 v0.9.2"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "标签: $TAG"
           echo "版本: $VERSION"
 
       - name: 应用补丁（DRY RUN）
@@ -178,15 +199,27 @@ jobs:
       #   · 从 git tag 推导 VERSION 并 --dart-define 注入
       #   · 注入 COMMIT / BUILD_TIME 等元信息
       # 不注入的话 BuildInfo.version 会是 pubspec 默认的 1.0.0
+      #
+      # 但它内部是 VERSION="${TAG#v}"，遇到 android11-v0.9.2 会得到
+      # "android11-v0.9.2" 这个非法版本号（App 用 pub_semver 比较会崩）。
+      # 所以先补一个纯 semver 的本地 tag（v0.9.2）指向当前提交，
+      # 让 git describe 取到它，不改动上游脚本。
       # -----------------------------------------------------------------------
       - name: 编译 APK
         run: |
+          VERSION="${{ needs.precheck.outputs.version }}"
+          LOCAL_TAG="v${VERSION}"
+
+          git tag -f "$LOCAL_TAG" HEAD >/dev/null
+          echo "已创建本地辅助 tag: $LOCAL_TAG → $(git rev-parse --short HEAD)"
+          echo "git describe: $(git describe --tags --abbrev=0)"
+
           if [ -x ./flutter_with_commit.sh ]; then
             ./flutter_with_commit.sh build apk --release --target-platform android-arm64
           else
             echo "::warning::flutter_with_commit.sh 不存在，降级为直接编译"
             flutter build apk --release --target-platform android-arm64 \
-              --dart-define=VERSION="${{ needs.precheck.outputs.version }}"
+              --dart-define=VERSION="$VERSION"
           fi
         env:
           FEEDBACK_TOKEN: ${{ secrets.FEEDBACK_TOKEN }}
@@ -237,7 +270,8 @@ jobs:
   # ===========================================================================
   # 阶段 3：发布（仅 tag 触发）
   # ===========================================================================
-  # tag 与上游完全一致（v0.9.3），便于版本对应。
+  # tag 带 android11- 前缀（android11-v0.9.3），与上游 v* 隔离：
+  # fork 继承了上游 78 个稳定版 tag，同名会导致互相覆盖。
   # 资产名带 android11 标识，与官方 decaid-android-*.apk 区分。
   # ===========================================================================
   release:

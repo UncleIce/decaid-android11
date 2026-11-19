@@ -71,46 +71,54 @@ jobs:
       # 关键：fork 会继承上游所有 tag，名字和我们发的一样（都是 v0.9.x）。
       # 所以「origin 上存在 v0.9.2」不代表我们已经发布过 —— 那可能是上游的。
       #
-      # 正确的判断依据：tag 指向的提交里有没有 patch-android11.sh。
-      #   · 有  → 这是我们打过补丁后发布的
-      #   · 没有 → 这是 fork 继承来的上游 tag，尚未发布
+      # 命名约定：上游 v0.9.2 → 本仓库 android11-v0.9.2
+      #   · 前缀隔离，绝不与上游 78 个稳定 tag 同名
+      #   · 因此可以放心用 --force 拉上游 tag，不会冲掉自己的
+      #   · 判断「是否已发布」直接看本仓库有没有 android11-v* 这个 tag
       # -----------------------------------------------------------------------
       - name: 检测上游新版本
         id: check
         run: |
           git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
 
-          # ★ 不要用 --force 拉 tag。
-          # 我们用与上游相同的 tag 名（v0.9.2），--force 会把已发布的
-          # 同名 tag 强制指回上游提交，冲掉我们自己打的 tag，
-          # 结果每次运行都判定「未发布」，无限重复构建。
-          # 不加 --force 时，已存在的 tag 保持不动，新 tag 正常拉取。
           git fetch upstream --tags --quiet
           git fetch origin --tags --force --quiet 2>/dev/null || true
 
-          # 上游最新稳定 tag（排除 beta/alpha/rc）
-          LATEST=$(git tag -l 'v*' --sort=-v:refname | grep -vE 'beta|alpha|rc' | head -1)
+          # 上游最新稳定 tag（排除 beta/alpha/rc），去掉可能存在的前缀
+          LATEST=$(git tag -l 'v*' | grep -vE 'beta|alpha|rc' \
+                   | grep -v '^android11-' | sort -V | tail -1)
 
           if [ -n "${{ inputs.force_version }}" ]; then
             LATEST="${{ inputs.force_version }}"
             echo "手动指定版本: $LATEST"
           fi
 
-          if [ -z "$LATEST" ]; then
+          # 统一成 vX.Y.Z
+          case "$LATEST" in
+            android11-*) LATEST="${LATEST#android11-}" ;;
+          esac
+          case "$LATEST" in
+            v*) ;;
+            *) LATEST="v$LATEST" ;;
+          esac
+
+          if [ -z "$LATEST" ] || [ "$LATEST" = "v" ]; then
             echo "::error::未找到上游 tag"
             exit 1
           fi
 
-          # 该 tag 指向的提交里是否含我们的补丁脚本
-          # = 是否为我们发布过的版本
+          OUR_TAG="android11-$LATEST"
+
+          # 本仓库是否已发布过这个版本
           ALREADY=0
-          if git cat-file -e "$LATEST:patch-android11.sh" 2>/dev/null; then
+          if git rev-parse -q --verify "refs/tags/$OUR_TAG" >/dev/null 2>&1; then
             ALREADY=1
           fi
 
-          echo "目标版本: $LATEST"
+          echo "上游版本: $LATEST"
+          echo "本仓库标签: $OUR_TAG"
           if [ "$ALREADY" = "1" ]; then
-            echo "状态: 该版本已由本仓库发布（tag 指向含 patch-android11.sh 的提交）"
+            echo "状态: 已发布过（$OUR_TAG 存在），跳过"
             echo "new=false" >> "$GITHUB_OUTPUT"
           else
             echo "状态: 尚未发布，需要构建"
@@ -118,6 +126,7 @@ jobs:
           fi
 
           echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "our_tag=$OUR_TAG" >> "$GITHUB_OUTPUT"
       # -----------------------------------------------------------------------
       # 补丁兼容性验证 —— 失败则不推 tag，避免产出坏包
       # -----------------------------------------------------------------------
@@ -178,10 +187,11 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # 推送同名 tag 触发构建
+      # 推送带前缀的 tag 触发构建
       # -----------------------------------------------------------------------
-      # 用户要求 tag 与上游一致。fork 的 tag 空间独立，可直接创建同名 tag。
-      # 若本仓库已存在该 tag（重跑场景），先删除再重建。
+      # 标签命名为 android11-vX.Y.Z，与上游 vX.Y.Z 隔离，
+      # 不会出现两个不同提交共用同一个 tag 名的情况。
+      # 重跑场景（dry_run 之后再跑）先删掉已存在的同名 tag。
       # -----------------------------------------------------------------------
       - name: 触发构建
         if: |
@@ -190,20 +200,22 @@ jobs:
           inputs.dry_run != true
         run: |
           LATEST="${{ steps.check.outputs.latest }}"
+          OUR_TAG="${{ steps.check.outputs.our_tag }}"
 
           # 删除本地同名 tag（若有）
-          git tag -d "$LATEST" 2>/dev/null || true
+          git tag -d "$OUR_TAG" 2>/dev/null || true
 
           # 删除远端同名 tag（若有，用于重跑）
-          git ls-remote --tags origin "refs/tags/$LATEST" 2>/dev/null \
-            | grep -q . && git push origin ":refs/tags/$LATEST" || true
+          if git ls-remote --tags origin "refs/tags/$OUR_TAG" 2>/dev/null | grep -q .; then
+            git push origin ":refs/tags/$OUR_TAG" || true
+          fi
 
           # 在 android11 分支的补丁提交上打 tag
           git checkout android11
-          git tag -a "$LATEST" -m "Android 11 适配版 $LATEST"
-          git push origin "$LATEST"
+          git tag -a "$OUR_TAG" -m "Android 11 适配版 ${LATEST}（基于上游 ${LATEST}）"
+          git push origin "$OUR_TAG"
 
-          echo "✓ 已推送 tag $LATEST，构建将自动开始"
+          echo "✓ 已推送 tag $OUR_TAG，构建将自动开始"
 
       # -----------------------------------------------------------------------
       # 补丁失效时创建 Issue 告警
@@ -277,6 +289,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| 目标版本 | \`${{ steps.check.outputs.latest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 上游版本 | \`${{ steps.check.outputs.latest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 本仓库标签 | \`${{ steps.check.outputs.our_tag }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| 需要构建 | ${{ steps.check.outputs.new }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 补丁兼容 | ${{ steps.verify.outputs.ok }} |" >> $GITHUB_STEP_SUMMARY
