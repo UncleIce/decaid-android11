@@ -118,12 +118,27 @@ adb install -r decaid-android11-0.9.2-arm64.apk
 | 情况 | 是否需要卸载 | 数据 |
 |---|---|---|
 | 已装本 fork 的旧版本 | 不需要，直接覆盖 | 保留 |
-| 已装官方 Decaid | **必须卸载** | 会丢失，先导出备份 |
+| 已装官方 Decaid | **必须卸载** | **可完整迁移**，卸载前先导出备份 |
 
 原因：两者签名不同（本 fork `953a1ad5…`，官方 `f4ae824f…`），
 Android 不允许签名不同的包互相升级。
 
-导出备份：App 内 `Settings → BACKUP`，或把 `/sdcard/de1beta` 整个拷走。
+> ⚠️ **从官方版切换前请务必先导出备份。**
+> 数据存在应用私有目录（`/data/data/net.tadel.reaprime/`），
+> 卸载会一并删除。但只要先导出备份，装好新版后导入即可完整恢复。
+> 详细步骤见 [`从官方版迁移.md`](从官方版迁移.md)。
+
+### 快速迁移（三步）
+
+```
+① 导出   浏览器打开 http://<平板IP>:8080 → Settings → Data → Backup → Export
+② 卸载   adb uninstall net.tadel.reaprime
+③ 导入   装好新版 → Settings → Data → Backup → Import
+```
+
+前提：官方版会拦截界面，需用**浏览器**访问 8080 端口操作导出。
+
+> 皮肤（skins）是插件形式，不在备份内，需重新安装。
 
 ---
 
