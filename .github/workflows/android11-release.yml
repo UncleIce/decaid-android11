@@ -130,7 +130,10 @@ jobs:
       - name: 安装 Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools'
+          # build-tools 必须装：apksigner 在这里面，用于校验产物签名。
+          # 只装 platform-tools 的话，后面的签名校验会因为找不到
+          # apksigner 而拿到空值，看起来像「签名不符」。
+          packages: 'platform-tools build-tools;36.0.0'
 
       # -----------------------------------------------------------------------
       # 签名密钥 —— 必须是你自己的密钥
@@ -244,12 +247,56 @@ jobs:
           fi
 
           echo "--- 验证 APK 签名 ---"
-          SIG=$(apksigner verify --print-certs "$APK" 2>/dev/null \
-                | grep 'SHA-256 digest' | head -1 | awk '{print $NF}')
-          echo "APK 签名: $SIG"
-          if [ -n "$EXPECTED_SIGNATURE" ] && [ "$SIG" != "$EXPECTED_SIGNATURE" ]; then
-            echo "::error::APK 签名不符！期望 $EXPECTED_SIGNATURE"
+
+          # 这个 APK 只使用 v2 签名方案，没有 META-INF/*.RSA，
+          # 因此 keytool 无法作为兜底 —— 必须真的找到 apksigner。
+          APKSIGNER=""
+          if command -v apksigner >/dev/null 2>&1; then
+            APKSIGNER="apksigner"
+          else
+            APKSIGNER=$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}" \
+                          -path '*build-tools*/apksigner' -type f 2>/dev/null \
+                        | sort -V | tail -1)
+          fi
+
+          if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
+            echo "::error::找不到 apksigner，无法校验签名"
+            echo "::error::检查 build 步骤是否安装了 build-tools"
+            echo "::error::ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<空>}"
+            ls "${ANDROID_SDK_ROOT:-/nonexistent}/build-tools" 2>/dev/null || echo "  (无 build-tools 目录)"
             exit 1
+          fi
+
+          echo "使用: $APKSIGNER"
+          verify_out=$("$APKSIGNER" verify -v --print-certs "$APK" 2>&1) || {
+            echo "$verify_out"
+            echo "::error::apksigner verify 失败"
+            exit 1
+          }
+
+          echo "$verify_out" | grep -iE 'Verified using|Number of signers' || true
+
+          SIG=$(printf '%s\n' "$verify_out" \
+                | grep -i 'SHA-256 digest' | head -1 \
+                | sed 's/.*: *//' | tr -d '\r ')
+
+          if [ -z "$SIG" ]; then
+            echo "$verify_out"
+            echo "::error::未能从 apksigner 输出中解析出 SHA-256 指纹"
+            exit 1
+          fi
+
+          echo "APK 签名: $SIG"
+
+          if [ -z "$EXPECTED_SIGNATURE" ]; then
+            echo "::warning::未配置 EXPECTED_SIGNATURE 变量，跳过指纹比对"
+          elif [ "$SIG" != "$EXPECTED_SIGNATURE" ]; then
+            echo "::error::APK 签名不符！"
+            echo "::error::实际: $SIG"
+            echo "::error::期望: $EXPECTED_SIGNATURE"
+            exit 1
+          else
+            echo "✓ 签名与期望一致，可覆盖升级"
           fi
 
       - name: 重命名产物
