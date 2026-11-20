@@ -117,7 +117,7 @@ jobs:
       - name: 安装 Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools'
+          packages: 'platform-tools build-tools;36.0.0'
 
       - name: 注入签名密钥
         run: |
@@ -213,12 +213,50 @@ jobs:
           done
 
           echo "--- 验证签名 ---"
-          SIG=$(apksigner verify --print-certs "$APK" 2>/dev/null \
-                | grep 'SHA-256 digest' | head -1 | awk '{print $NF}')
-          echo "签名: $SIG"
-          if [ -n "$EXPECTED_SIGNATURE" ] && [ "$SIG" != "$EXPECTED_SIGNATURE" ]; then
-            echo "::error::签名不符！"
+
+          # APK 只使用 v2 签名方案，没有 META-INF/*.RSA，
+          # keytool 无法兜底，必须真的找到 apksigner。
+          APKSIGNER=""
+          if command -v apksigner >/dev/null 2>&1; then
+            APKSIGNER="apksigner"
+          else
+            APKSIGNER=$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}" \
+                          -path '*build-tools*/apksigner' -type f 2>/dev/null \
+                        | sort -V | tail -1)
+          fi
+
+          if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
+            echo "::error::找不到 apksigner，无法校验签名"
+            echo "::error::ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<空>}"
             exit 1
+          fi
+
+          echo "使用: $APKSIGNER"
+          verify_out=$("$APKSIGNER" verify -v --print-certs "$APK" 2>&1) || {
+            echo "$verify_out"
+            echo "::error::apksigner verify 失败"
+            exit 1
+          }
+          echo "$verify_out" | grep -iE 'Verified using|Number of signers' || true
+
+          SIG=$(printf '%s\n' "$verify_out" \
+                | grep -i 'SHA-256 digest' | head -1 \
+                | sed 's/.*: *//' | tr -d '\r ')
+
+          if [ -z "$SIG" ]; then
+            echo "$verify_out"
+            echo "::error::未能解析出 SHA-256 指纹"
+            exit 1
+          fi
+
+          echo "签名: $SIG"
+          if [ -z "$EXPECTED_SIGNATURE" ]; then
+            echo "::warning::未配置 EXPECTED_SIGNATURE，跳过比对"
+          elif [ "$SIG" != "$EXPECTED_SIGNATURE" ]; then
+            echo "::error::签名不符！实际 $SIG 期望 $EXPECTED_SIGNATURE"
+            exit 1
+          else
+            echo "✓ 签名一致"
           fi
 
       - name: 重命名
