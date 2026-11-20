@@ -1,11 +1,187 @@
-# Decaid fork 搭建手册
+# Decaid for Android 11
 
-> 目标：让 Decaid 在 Android 11 上内嵌显示界面，并自动跟进上游新版本、自动编译发布。
->
-> 仓库：https://github.com/UncleIce/decaid-android11
-> 基线：https://github.com/decentespresso/decaid （GPL-3.0）
+> 让 [Decaid](https://github.com/decentespresso/decaid) 在 Android 11 及更早的设备上
+> 直接内嵌显示咖啡机界面，而不是只给你一个"用浏览器打开"的卡片。
+
+**本仓库**：https://github.com/UncleIce/decaid-android11
+**上游项目**：https://github.com/decentespresso/decaid —— 功能、文档、使用说明请先看那里
+
+> ⚠️ **非官方构建**。本项目是个人 fork，与 Decent Espresso 无关。
+> 所有功能归功于上游作者，本仓库只做了一处针对旧版 Android 的适配。
 
 ---
+
+## 这个 fork 解决什么问题
+
+Decaid 的 `lib/src/app.dart` 里有这么一段：
+
+```dart
+Future<void> _resolveDegradedAndroid() async {
+  final info = await DeviceInfoPlugin().androidInfo;
+  if (mounted && info.version.sdkInt < 31) {      // ← Android 12 以下
+    setState(() => _degradedAndroid = true);      //    标记为"降级模式"
+  }
+}
+```
+
+被标记降级后，`_navigateAfterOnboarding()` 会直接返回，不打开皮肤：
+
+```dart
+if (!supportedPlatforms || _degradedAndroid) return;
+```
+
+结果：**Android 11 及以前的设备打开 App 后，只看到一个引导卡片，
+让你去系统浏览器访问本地 Web 界面**，无法在 App 内使用。
+
+而实际上：
+
+| 项目 | 值 |
+|---|---|
+| 上游 `minSdk` | **28**（Android 9） |
+| 兼容性检查的真实门槛 | `sdkInt < 29` 才判定不兼容 |
+| 降级判定门槛 | `sdkInt < 31`（Android 12） |
+
+两者不一致 —— 系统允许安装，兼容检查也认为 Android 11 没问题，
+但界面逻辑仍然按 Android 12+ 处理。这个 fork 去掉的就是这处限制。
+
+---
+
+## 支持范围
+
+### 已支持
+
+| 能力 | 说明 |
+|---|---|
+| Android 11（SDK 30）内嵌显示 | 核心改动 |
+| Android 12+ | 与官方版本行为一致 |
+| Android 9–10（SDK 28–29） | 本补丁同样放行，但**未在实机验证**；这些版本 WebView 内核较旧，皮肤可能有渲染问题 |
+| 所有上游功能 | 咖啡机连接、萃取、秤、皮肤、插件等，与官方版本相同 |
+| 跟随上游更新 | 自动检测上游新版本，补丁可应用时自动构建发布 |
+
+### 实测环境
+
+| 项目 | 值 |
+|---|---|
+| 设备 | Samsung Galaxy Tab S5e（SM-T727U） |
+| 系统 | Android 11，SDK 30 |
+| 屏幕 | 1600×2560，density 360 |
+| 基于版本 | upstream `v0.9.2` |
+
+### 不支持
+
+| 项目 | 原因 |
+|---|---|
+| iOS / macOS / Windows / Linux | 本 fork 只构建 Android arm64 |
+| Android 8 及更早 | 上游 `minSdk = 28`，装不上 |
+| 官方 OTA 更新 | 签名不同，官方包会安装失败 |
+
+---
+
+## 改了什么
+
+一共 **3 处代码改动**（基础版），全部集中在"是否允许内嵌显示"这一条路径上，
+不涉及任何咖啡机通信、数据处理或界面渲染逻辑。
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `lib/src/services/webview_compatibility_checker.dart` | 跳过启动时的 WebView 自检（含渲染测试和部分厂商的固定延迟） |
+| 2 | `lib/src/app.dart` | 不再因 `sdkInt < 31` 置降级标志 |
+| 3 | `lib/src/app.dart` | 引导结束后正常打开皮肤，而非停在浏览器引导卡片 |
+
+> 补丁 1 是可选的加速项：自检的真实 SDK 门槛是 29，Android 11 本来能通过。
+> 去掉它可以缩短启动时间，也避免个别机型在渲染测试上偶发误判。
+> 真正起决定作用的是补丁 2 和 3。
+
+改完后启动日志会打印：
+
+```
+PATCHED: Android SDK 30 - degraded mode DISABLED
+```
+
+**除此之外没有任何修改。** 补丁脚本 `patch-android11.sh` 里每处改动都有完整注释，
+可以直接阅读核对。
+
+可选：加 `--with-ota` 会额外改 8 处，把 App 内更新指向本仓库并支持同版本重构建识别。
+默认不启用，详见 `README-OTA.md`。
+
+---
+
+## 安装
+
+从 [Releases](https://github.com/UncleIce/decaid-android11/releases) 下载
+`decaid-android11-<版本>-arm64.apk`。
+
+```bash
+adb install -r decaid-android11-0.9.2-arm64.apk
+```
+
+| 情况 | 是否需要卸载 | 数据 |
+|---|---|---|
+| 已装本 fork 的旧版本 | 不需要，直接覆盖 | 保留 |
+| 已装官方 Decaid | **必须卸载** | 会丢失，先导出备份 |
+
+原因：两者签名不同（本 fork `953a1ad5…`，官方 `f4ae824f…`），
+Android 不允许签名不同的包互相升级。
+
+导出备份：App 内 `Settings → BACKUP`，或把 `/sdcard/de1beta` 整个拷走。
+
+---
+
+## 版本号规则
+
+| 上游 | 本仓库 | App 内显示 |
+|---|---|---|
+| `v0.9.2` | `android11-v0.9.2` | `0.9.2` |
+
+tag 带 `android11-` 前缀，因为 fork 会继承上游全部 tag，同名会互相覆盖
+（详见 `维护手册.md`）。App 内显示的版本号与上游一致，便于对照。
+
+---
+
+## 更新与维护
+
+| 场景 | 你的操作 |
+|---|---|
+| 上游发布新版本 | 通常无需操作，自动跟进 |
+| 补丁失效（上游改代码） | 收到 Issue 通知，按 `维护手册.md` 修复 |
+| 想立即发布某版本 | Actions → Sync Upstream → 填 `force_version` |
+
+自动同步每天运行一次，流程是：检测上游新 tag → 验证补丁可应用 → 应用并提交 → 打 tag → 编译 → 发布 Release。
+
+---
+
+## 许可
+
+本项目与上游同为 **GPL-3.0**，`LICENSE.txt` 未作修改。
+
+| 义务 | 本仓库做法 |
+|---|---|
+| 公开源码 | 仓库公开，含完整补丁脚本 |
+| 保留版权声明 | `LICENSE.txt` 原样保留 |
+| 标明修改 | 代码里标注 `PATCHED`，README 列出全部改动 |
+| 相同许可分发 | 保持 GPL-3.0 |
+| 不冒充官方 | 各处以"非官方构建"标明 |
+
+由于 GPL-3.0 要求分发修改版时提供对应源码，本仓库公开即为满足。
+
+---
+
+## 上游项目
+
+功能和文档请看上游：
+
+- 仓库：https://github.com/decentespresso/decaid
+- Releases：https://github.com/decentespresso/decaid/releases
+- Issues：https://github.com/decentespresso/decaid/issues
+
+**上游能用的情况下请优先用官方版本。** 本 fork 只对旧版 Android 有意义，
+如果上游哪天自己支持了 Android 11，这个项目就应该退休
+（判断方法见 `维护手册.md` 第八节）。
+
+---
+
+## 下面是完整的搭建与维护文档
+
 
 ## 这个包里的文件
 
@@ -17,7 +193,8 @@
 | `android11-release-ota.yml` | 编译发布 workflow（OTA 版） | 二选一 |
 | `sync-upstream.yml` | 自动跟进上游 workflow | `.github/workflows/` |
 | `README-OTA.md` | OTA 详细说明（第二阶段） | — |
-| `README.md` | 本手册 | — |
+| `维护手册.md` | 日常维护、故障排查、退休判断 | — |
+| `README.md` | 本文件 | — |
 
 **一个脚本两种模式**：
 
@@ -379,7 +556,7 @@ adb shell "dumpsys package net.tadel.reaprime | grep signatures"
 
 ### Release 没有自动创建
 
-- 检查 tag 是否 `v` 开头
+- 检查 tag 是否是 `android11-v*` 格式（只有这个模式会触发）
 - 检查是否手动触发（`workflow_dispatch` 不发布，只有 tag 才发布）
 - 检查 `Settings → Actions → Workflow permissions` 是否 Read and write
 
@@ -387,7 +564,7 @@ adb shell "dumpsys package net.tadel.reaprime | grep signatures"
 
 ## 关于 OTA
 
-**当前版本没有改 OTA 逻辑**，因此：
+默认（基础版）**没有改 OTA 逻辑**，因此：
 
 | 场景 | 结果 |
 |---|---|
@@ -396,11 +573,10 @@ adb shell "dumpsys package net.tadel.reaprime | grep signatures"
 
 ### 如果要启用 OTA
 
-需要 4 处补丁（改数据源指向你的 fork）+ 1 处版本比较逻辑改动。详见
-`04-签名与数据.md` 或联系我补充。核心难点：
+用 `--with-ota` 重跑补丁脚本，再换用 `android11-release-ota.yml`。
+它会改 4 处数据源（指向本仓库）+ 4 处版本比较逻辑（识别同版本重构建）。
 
-- tag 用上游原样（`v0.9.3`）时，版本号与本地相同 → OTA 判定"无更新"
-- 需要额外比较 `BUILD_NUMBER` 才能识别同版本的重构建
+核心难点与完整步骤见 `README-OTA.md`。
 
 **建议先把当前流程跑稳一两个版本，再考虑加 OTA。**
 
