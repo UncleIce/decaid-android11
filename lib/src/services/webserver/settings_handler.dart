@@ -5,12 +5,14 @@ class SettingsHandler {
   final WebUIService _webUIService;
   final WebUIStorage _webUIStorage;
   final BatteryController? _batteryController;
+  final DeviceScanner? _deviceScanner;
 
   SettingsHandler({
     required this._controller,
     required WebUIService service,
     required this._webUIStorage,
     this._batteryController,
+    this._deviceScanner,
   }) : _webUIService = service;
 
   void addRoutes(RouterPlus app) {
@@ -27,7 +29,18 @@ class SettingsHandler {
       final blockTareDuringShot = _controller.blockTareDuringShot;
       final stopHotWaterAtWeight = _controller.stopHotWaterAtWeight;
       final preferredMachineId = _controller.preferredMachineId;
-      final preferredScaleId = _controller.preferredScaleId;
+      final savedScalePreference = _controller.preferredScaleId;
+      final preferredScaleId = savedScalePreference == usbHdsScalePreference
+          ? _deviceScanner?.devices
+                    .whereType<Scale>()
+                    .where(
+                      (scale) =>
+                          matchesScalePreference(scale, savedScalePreference),
+                    )
+                    .singleOrNull
+                    ?.deviceId ??
+                savedScalePreference
+          : savedScalePreference;
       final preferredGrinderDeviceId = _controller.preferredGrinderDeviceId;
       final defaultSkinId = _controller.defaultSkinId;
       final automaticUpdateCheck = _controller.automaticUpdateCheck;
@@ -77,14 +90,21 @@ class SettingsHandler {
       final enablesAutomaticUpdates =
           json['automaticUpdateCheck'] == true &&
           !_controller.automaticUpdateCheck;
-      final extensionsAuthorized = mayManageExtensions(request);
       if (changesSkin || enablesAutomaticUpdates) {
-        final denial = requireExtensionManagement(
+        final originRefusal = requireTrustedBrowserOrigin(
+          request,
+          action: 'POST /api/v1/settings extension settings',
+        );
+        if (originRefusal != null) return originRefusal;
+        final denial = await requireExtensionManagement(
           request,
           action: 'POST /api/v1/settings extension settings',
         );
         if (denial != null) return denial;
       }
+      final freezeUntrustedExtensionSettings = isUntrustedBrowserOrigin(
+        request,
+      );
       if (json.containsKey('gatewayMode')) {
         final GatewayMode? gatewayMode = GatewayModeFromString.fromString(
           json['gatewayMode'],
@@ -189,7 +209,19 @@ class SettingsHandler {
       if (json.containsKey('preferredScaleId')) {
         final value = json['preferredScaleId'];
         if (value == null || value is String) {
-          await _controller.setPreferredScaleId(value);
+          final scale = _deviceScanner?.devices
+              .whereType<Scale>()
+              .where((scale) => scale.deviceId == value)
+              .firstOrNull;
+          final preferenceId = scale == null ? value : scalePreferenceId(scale);
+          if (preferenceId != null && isEphemeralDeviceIdentity(preferenceId)) {
+            return jsonBadRequest({
+              'message':
+                  'Session-only scale ID is not a durable preference. '
+                  'Select a discovered USB HDS or use usb-hds:any.',
+            });
+          }
+          await _controller.setPreferredScaleId(preferenceId);
         } else {
           return jsonBadRequest({
             'message': 'preferredScaleId must be a string or null',
@@ -206,7 +238,9 @@ class SettingsHandler {
           });
         }
       }
-      if (extensionsAuthorized && json.containsKey('defaultSkinId')) {
+      if (json.containsKey('defaultSkinId') &&
+          !freezeUntrustedExtensionSettings &&
+          await mayManageExtensions(request)) {
         final value = json['defaultSkinId'];
         if (value is String) {
           try {
@@ -223,7 +257,9 @@ class SettingsHandler {
       if (json.containsKey('automaticUpdateCheck')) {
         final value = json['automaticUpdateCheck'];
         if (value is bool) {
-          if (extensionsAuthorized || !value) {
+          if (!value ||
+              (!freezeUntrustedExtensionSettings &&
+                  await mayManageExtensions(request))) {
             await _controller.setAutomaticUpdateCheck(value);
           }
         } else {

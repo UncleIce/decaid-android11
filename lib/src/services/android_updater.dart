@@ -7,9 +7,14 @@ import 'package:path_provider/path_provider.dart';
 import 'package:pub_semver/pub_semver.dart';
 import 'package:uuid/uuid.dart';
 import 'package:reaprime/src/services/apk_installer.dart';
+import 'package:reaprime/src/services/apk_install_coordinator.dart';
+import 'package:reaprime/src/services/github_credentials.dart';
 import 'package:reaprime/src/services/github_rate_limit.dart';
 import 'package:reaprime/src/services/github_request.dart';
 import 'package:reaprime/src/util/remote_error.dart';
+
+export 'apk_install_coordinator.dart'
+    show ApkInstallOutcome, InvalidApkException;
 
 class UpdateInfo {
   final String version;
@@ -52,6 +57,8 @@ class UpdateCheckException extends GithubRequestException {
     super.statusCode,
     super.rateLimited,
     super.resetAt,
+    super.credentialRejected,
+    super.userMessageOverride,
   });
 }
 
@@ -63,17 +70,25 @@ class AndroidUpdater {
   final String _repo;
   final http.Client _httpClient;
   final ApkInstaller _apkInstaller;
+  final bool _isAndroid;
+  ApkInstallCoordinator? _installCoordinator;
+  int _installGeneration = 0;
+  bool _disposed = false;
   final GithubRateLimit _rateLimit;
+  final GithubCredentialProvider? credentials;
 
   AndroidUpdater({
     required this._owner,
     required this._repo,
     http.Client? httpClient,
     ApkInstaller? apkInstaller,
+    bool? platformIsAndroid,
     DateTime Function()? now,
     GithubRateLimit? rateLimit,
+    this.credentials,
   }) : _rateLimit = rateLimit ?? GithubRateLimit(now: now),
        _httpClient = httpClient ?? http.Client(),
+       _isAndroid = platformIsAndroid ?? Platform.isAndroid,
        _apkInstaller = apkInstaller ?? ApkInstaller();
 
   String get _releasesUrl =>
@@ -92,6 +107,7 @@ class AndroidUpdater {
         _releasesUrl,
         rateLimit: _rateLimit,
         client: _httpClient,
+        credentials: credentials,
       );
 
       final releases = json.decode(response.body) as List<dynamic>;
@@ -132,6 +148,8 @@ class AndroidUpdater {
         statusCode: e.statusCode,
         rateLimited: e.rateLimited,
         resetAt: e.resetAt,
+        credentialRejected: e.credentialRejected,
+        userMessageOverride: e.userMessage,
       );
     } catch (e, stackTrace) {
       _log.severe('Error checking for updates', e, stackTrace);
@@ -194,28 +212,37 @@ class AndroidUpdater {
     }
   }
 
-  Future<bool> installUpdate(String apkPath) async {
-    if (!Platform.isAndroid) {
+  Future<bool> canInstallPackages() async =>
+      _isAndroid && await _apkInstaller.canInstallPackages();
+
+  Future<bool> isDownloadedApkValid(String path) =>
+      _apkInstaller.isValidApk(path);
+
+  Future<ApkInstallOutcome> installUpdate(
+    String apkPath, {
+    bool requestPermission = true,
+  }) async {
+    if (!_isAndroid) {
       throw UnsupportedError('APK installation is only supported on Android');
     }
-
-    try {
-      _log.info('Installing update from $apkPath');
-
-      final canInstall = await _apkInstaller.canInstallPackages();
-      if (!canInstall) {
-        _log.warning(
-          'No permission to install packages, requesting permission',
-        );
-        await _apkInstaller.requestInstallPermission();
-        return false;
-      }
-
-      return await _apkInstaller.installApk(apkPath);
-    } catch (e, stackTrace) {
-      _log.severe('Error installing update', e, stackTrace);
-      rethrow;
+    if (_disposed) return ApkInstallOutcome.cancelled;
+    final generation = _installGeneration;
+    final valid = await isDownloadedApkValid(apkPath);
+    if (_disposed || generation != _installGeneration) {
+      return ApkInstallOutcome.cancelled;
     }
+    if (!valid) throw const InvalidApkException();
+    final coordinator = _installCoordinator ??= ApkInstallCoordinator(
+      _apkInstaller,
+    );
+    return coordinator.install(apkPath, requestPermission: requestPermission);
+  }
+
+  void cancelInstall() {
+    _installGeneration++;
+    final coordinator = _installCoordinator;
+    _installCoordinator = null;
+    coordinator?.dispose();
   }
 
   UpdateInfo? _parseRelease(Object? release, UpdateChannel channel) {
@@ -244,6 +271,8 @@ class AndroidUpdater {
   }
 
   void dispose() {
+    _disposed = true;
+    cancelInstall();
     _httpClient.close();
   }
 }
