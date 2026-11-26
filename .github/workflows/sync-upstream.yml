@@ -183,8 +183,7 @@ jobs:
             git commit -m "chore(android11): 适配 $LATEST"
           fi
           git push origin android11 --force
-            echo "✓ 已推送到 android11 分支"
-          fi
+          echo "✓ 已推送到 android11 分支"
 
       # -----------------------------------------------------------------------
       # 推送带前缀的 tag 触发构建
