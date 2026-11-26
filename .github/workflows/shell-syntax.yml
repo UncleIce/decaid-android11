@@ -1,0 +1,43 @@
+name: Shell syntax
+
+# Parses every `run:` block in our workflow files with `bash -n`.
+#
+# GitHub only parses a run block when the job actually fires, so a stray
+# `fi` stays hidden until then. On 2026-11-24 and 2026-11-25 a broken
+# sync-upstream step aborted after committing the patch but before
+# pushing it, which silently withheld the v0.9.3 release for two days.
+# Nothing executed: this job only asks bash whether the code parses.
+
+on:
+  push:
+    branches: [main, android11]
+    paths:
+      - '.github/workflows/**'
+      - 'tool/ci/check_shell_syntax.py'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - 'tool/ci/check_shell_syntax.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shell-syntax-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check shell syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet --disable-pip-version-check pyyaml
+
+      - name: Check workflow run blocks and shell scripts
+        run: python3 tool/ci/check_shell_syntax.py
