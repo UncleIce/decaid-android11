@@ -324,7 +324,15 @@ jobs:
   release:
     name: 发布 Release
     needs: [precheck, build]
-    if: startsWith(github.ref, 'refs/tags/')
+    # 两种触发都要发布：
+    #   tag push          → github.ref 是 refs/tags/*，用 ref_name
+    #   workflow_dispatch → sync-upstream 调用，ref_name 是 android11，
+    #                       真正的 tag 来自 inputs.tag
+    # 原先只认 tag，导致 sync 自动触发的构建永远不发版。
+    if: |
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.tag != '' && !endsWith(inputs.tag, '-dryrun'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -336,15 +344,39 @@ jobs:
           name: android11-apk
           path: out
 
+      - name: 解析发布用的 tag
+        id: rel
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            IN="${{ inputs.tag }}"
+            case "$IN" in
+              android11-*) TAG="$IN" ;;
+              v*)          TAG="android11-$IN" ;;
+              *)           TAG="android11-v$IN" ;;
+            esac
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "发布标签: $TAG"
+
+      - name: 确认 tag 已存在
+        run: |
+          git ls-remote --tags origin "refs/tags/${{ steps.rel.outputs.tag }}" \
+            | grep -q . || {
+              echo "::error::tag ${{ steps.rel.outputs.tag }} 不存在，拒绝发布"
+              exit 1
+            }
+
       - name: 生成 Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "${{ github.ref_name }} — Android 11 适配版"
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: "${{ steps.rel.outputs.tag }} — Android 11 适配版"
           prerelease: false      # OTA 只认非 prerelease
           files: out/*
           body: |
-            ## Android 11 适配版（${{ github.ref_name }}）
+            ## Android 11 适配版（${{ steps.rel.outputs.tag }}）
 
             > ⚠️ **非官方构建**，基于 [decentespresso/decaid](https://github.com/decentespresso/decaid)（GPL-3.0）
             > 仅解除 Android 12+ 的限制，其余功能与官方一致。
